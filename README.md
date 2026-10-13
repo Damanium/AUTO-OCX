@@ -3,7 +3,7 @@
 Registra o desregistra varios controles ActiveX (`.ocx`, `.dll`, `.ax`) a la vez con `regsvr32`.
 Detecta si cada archivo es de 32 o 64 bits y usa el `regsvr32` correcto. Pide permisos de administrador (UAC) al abrirse.
 
-- **Versión:** 1.1.0
+- **Versión:** 1.2.0
 - **Autor:** Juan Carlos Alvarez Oncala — juankylodk@gmail.com
 - **Licencia:** MIT. Software gratuito y de uso libre (ver [LICENSE](LICENSE)).
 

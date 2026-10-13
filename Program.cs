@@ -3,7 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
+using ComTypes = System.Runtime.InteropServices.ComTypes;
 using System.Threading;
+using Microsoft.Win32;
 using System.Windows.Forms;
 
 namespace AutoOcx
@@ -29,6 +32,7 @@ namespace AutoOcx
         ProgressBar progress;
         Button btnAdd, btnFolder, btnRemove, btnClear, btnRegister, btnUnregister;
         Label lblStatus;
+        CheckBox chkCopy;
         bool busy;
         Button[] saveLoad;
 
@@ -100,12 +104,17 @@ namespace AutoOcx
             var bottom = new Panel { Dock = DockStyle.Bottom, Height = 84 };
             progress = new ProgressBar { Left = 12, Top = 8, Height = 10, Width = 100, Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top };
             lblStatus = new Label { Left = 12, Top = 24, AutoSize = true, ForeColor = Color.DimGray, Text = "Admin: " + (IsAdmin() ? "sí" : "no") };
+            chkCopy = new CheckBox
+            {
+                Left = 130, Top = 22, AutoSize = true,
+                Text = "Copiar a la carpeta del sistema (System32/SysWOW64) antes de registrar"
+            };
             btnUnregister = Btn("Desregistrar", false, (s, e) => Run(false));
             btnRegister = Btn("Registrar todo", true, (s, e) => Run(true));
             btnRegister.Size = new Size(160, 38);
             btnUnregister.Size = new Size(130, 38);
             btnRegister.Anchor = btnUnregister.Anchor = AnchorStyles.Right | AnchorStyles.Top;
-            bottom.Controls.AddRange(new Control[] { progress, lblStatus, btnUnregister, btnRegister });
+            bottom.Controls.AddRange(new Control[] { progress, lblStatus, chkCopy, btnUnregister, btnRegister });
             bottom.Resize += (s, e) =>
             {
                 progress.Width = bottom.ClientSize.Width - 24;
@@ -263,16 +272,111 @@ namespace AutoOcx
             return 0;
         }
 
-        static string Regsvr32For(int bits)
+        // Carpeta del sistema que corresponde a los bits del OCX (la real, sin redireccion).
+        static string SysDirFor(int bits)
         {
             string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (!Environment.Is64BitOperatingSystem) return Path.Combine(win, "System32");
+            if (bits == 32) return Path.Combine(win, "SysWOW64");
             // Proceso de 32 bits en Windows de 64: System32 se redirige; Sysnative da el real.
-            bool os64 = Environment.Is64BitOperatingSystem;
-            if (!os64) return Path.Combine(win, "System32", "regsvr32.exe");
-            if (bits == 32) return Path.Combine(win, "SysWOW64", "regsvr32.exe");
-            return Environment.Is64BitProcess
-                ? Path.Combine(win, "System32", "regsvr32.exe")
-                : Path.Combine(win, "Sysnative", "regsvr32.exe");
+            return Environment.Is64BitProcess ? Path.Combine(win, "System32") : Path.Combine(win, "Sysnative");
+        }
+
+        static string Regsvr32For(int bits)
+        {
+            return Path.Combine(SysDirFor(bits), "regsvr32.exe");
+        }
+
+        // Copia el OCX a la carpeta del sistema. Devuelve la ruta a registrar (la copia, o la original si no se pudo).
+        static string CopyToSystem(string path, int bits, out string note)
+        {
+            note = null;
+            try
+            {
+                string dest = Path.Combine(SysDirFor(bits), Path.GetFileName(path));
+                if (string.Equals(dest, path, StringComparison.OrdinalIgnoreCase)) return path;
+                if (File.Exists(dest))
+                {
+                    note = "ya existe en la carpeta del sistema; se registra la ruta original";
+                    return path;
+                }
+                File.Copy(path, dest, false);
+                note = "copiado a " + dest;
+                return dest;
+            }
+            catch (Exception ex)
+            {
+                note = "no se pudo copiar (" + ex.Message + "); se registra la ruta original";
+                return path;
+            }
+        }
+
+        [DllImport("oleaut32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        static extern void LoadTypeLibEx(string file, int regKind, out ComTypes.ITypeLib lib);
+
+        // CLSID de las clases COM que declara la libreria de tipos del OCX.
+        static List<Guid> GetClsids(string path)
+        {
+            var res = new List<Guid>();
+            ComTypes.ITypeLib lib;
+            LoadTypeLibEx(path, 2 /* REGKIND_NONE: no registra */, out lib);
+            try
+            {
+                int n = lib.GetTypeInfoCount();
+                for (int i = 0; i < n; i++)
+                {
+                    ComTypes.TYPEKIND kind;
+                    lib.GetTypeInfoType(i, out kind);
+                    if (kind != ComTypes.TYPEKIND.TKIND_COCLASS) continue;
+                    ComTypes.ITypeInfo info;
+                    lib.GetTypeInfo(i, out info);
+                    IntPtr ptr;
+                    info.GetTypeAttr(out ptr);
+                    try { res.Add(((ComTypes.TYPEATTR)Marshal.PtrToStructure(ptr, typeof(ComTypes.TYPEATTR))).guid); }
+                    finally { info.ReleaseTypeAttr(ptr); Marshal.ReleaseComObject(info); }
+                }
+            }
+            finally { Marshal.ReleaseComObject(lib); }
+            return res;
+        }
+
+        // Comprueba en el registro (vista de 32 o 64 bits) que los CLSID del OCX
+        // estan registrados y apuntan al archivo. state: 0 = verificado, 1 = no verificable, 2 = fallo.
+        static string Verify(string path, int bits, bool register, out int state)
+        {
+            state = 1;
+            List<Guid> clsids;
+            try { clsids = GetClsids(path); }
+            catch { return "sin verificar (el archivo no tiene libreria de tipos)"; }
+            if (clsids.Count == 0) return "sin verificar (no declara clases COM)";
+
+            var view = (bits == 32 || !Environment.Is64BitOperatingSystem) ? RegistryView.Registry32 : RegistryView.Registry64;
+            int found = 0, wrongPath = 0;
+            string other = null;
+            using (var root = RegistryKey.OpenBaseKey(RegistryHive.ClassesRoot, view))
+            {
+                foreach (var g in clsids)
+                {
+                    using (var k = root.OpenSubKey(@"CLSID\" + g.ToString("B") + @"\InprocServer32"))
+                    {
+                        if (k == null) continue;
+                        found++;
+                        string v = Environment.ExpandEnvironmentVariables(((k.GetValue(null) as string) ?? "").Trim().Trim('"'));
+                        if (!string.Equals(v, path, StringComparison.OrdinalIgnoreCase)) { wrongPath++; other = v; }
+                    }
+                }
+            }
+            string vista = view == RegistryView.Registry32 ? "32 bits" : "64 bits";
+            if (register)
+            {
+                if (found == 0) { state = 2; return "regsvr32 dijo OK pero NO hay CLSID en el registro de " + vista; }
+                if (wrongPath > 0) { state = 2; return "registrado, pero apunta a otra ruta: " + other; }
+                state = 0;
+                return "verificado (" + found + " clase(s) en el registro de " + vista + ")";
+            }
+            if (found > 0) { state = 2; return "aun quedan " + found + " CLSID en el registro de " + vista; }
+            state = 0;
+            return "verificado (sin CLSID en el registro de " + vista + ")";
         }
 
         void Run(bool register)
@@ -284,6 +388,7 @@ namespace AutoOcx
             progress.Value = 0;
             var items = new List<ListViewItem>();
             foreach (ListViewItem i in list.Items) { items.Add(i); i.SubItems[3].Text = "Esperando…"; i.ForeColor = Color.Black; }
+            bool copy = chkCopy.Checked && register;
             Log(register ? "--- Registrando ---" : "--- Desregistrando ---", Accent);
 
             new Thread(() =>
@@ -293,15 +398,31 @@ namespace AutoOcx
                 {
                     string path = (string)it.Tag;
                     int bits = GetBitness(path);
+                    string note = null;
+                    if (copy && bits != 0) path = CopyToSystem(path, bits, out note);
                     var res = Exec(Regsvr32For(bits), (register ? "" : "/u ") + "/s \"" + path + "\"");
                     bool success = res == 0;
+                    string detail = null;
+                    int state = 1;
+                    if (success) detail = Verify(path, bits, register, out state);
+                    if (success && state == 2) success = false;
                     if (success) ok++; else fail++;
+                    string extra = null;
+                    if (success && register && bits == 32 && Environment.Is64BitOperatingSystem)
+                        extra = "OCX de 32 bits: solo lo veran programas de 32 bits";
+                    string status = success
+                        ? (register ? "Registrado" : "Desregistrado") + (state == 0 ? " (verificado)" : " (sin verificar)")
+                        : (res == 0 ? "Sin efecto" : "Error (código " + res + ")");
+                    string why = res != 0 ? Describe(res) : detail;
                     BeginInvoke((Action)(() =>
                     {
-                        it.SubItems[3].Text = success ? (register ? "Registrado" : "Desregistrado") : "Error (código " + res + ")";
+                        it.SubItems[3].Text = status;
                         it.ForeColor = success ? Color.FromArgb(0, 128, 0) : Color.Firebrick;
-                        Log((success ? "OK    " : "ERROR ") + Path.GetFileName(path) + (success ? "" : "  -> " + Describe(res)),
+                        Log((success ? "OK    " : "ERROR ") + Path.GetFileName(path) + "  [" + (bits == 0 ? "?" : bits.ToString()) + " bits]"
+                            + (success ? (detail != null ? "  " + detail : "") : "  -> " + why),
                             success ? Color.FromArgb(0, 128, 0) : Color.Firebrick);
+                        if (note != null) Log("      " + note, Color.DarkOrange);
+                        if (extra != null) Log("      " + extra, Color.DarkOrange);
                         progress.Value = Math.Min(progress.Maximum, progress.Value + 1);
                     }));
                 }
@@ -333,10 +454,10 @@ namespace AutoOcx
             switch (code)
             {
                 case 1: return "argumentos no válidos";
-                case 2: return "fallo al cargar la DLL/OCX (dependencias o bits incorrectos)";
-                case 3: return "no se encontró DllRegisterServer/DllUnregisterServer";
-                case 4: return "fallo al ejecutar el registro (¿permisos?)";
-                case 5: return "fallo de registro";
+                case 2: return "fallo al inicializar OLE";
+                case 3: return "no se pudo cargar el archivo (faltan dependencias, bits incorrectos o no es un OCX/DLL válido)";
+                case 4: return "no exporta DllRegisterServer/DllUnregisterServer (no es un control registrable)";
+                case 5: return "DllRegisterServer devolvió error (¿permisos, licencia o claves de registro protegidas?)";
                 case -1: return "tiempo de espera agotado";
                 case -2: return "no se pudo ejecutar regsvr32";
                 default: return "código " + code;
@@ -347,6 +468,7 @@ namespace AutoOcx
         {
             foreach (var b in new[] { btnAdd, btnFolder, btnRemove, btnClear, btnRegister, btnUnregister }) b.Enabled = on;
             foreach (var b in saveLoad) b.Enabled = on;
+            chkCopy.Enabled = on;
             AllowDrop = on;
         }
 
